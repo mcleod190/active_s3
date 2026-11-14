@@ -1,0 +1,44 @@
+#!/bin/bash
+
+set -o pipefail
+
+# Load Ceph S3 credentials
+set -a
+source .env
+set +a
+
+q() { docker exec "$C" sh -c "psql -U postgres -d postgres -Atc \"$1\""; }
+state() { q "select pg_get_wal_replay_pause_state()"; }
+
+# Always resume WAL replay when the script exits
+trap 'q "select pg_wal_replay_resume()" >/dev/null; echo "replay: $(state)"' EXIT
+
+q "select pg_wal_replay_pause()" >/dev/null || exit 1
+for i in $(seq 30); do [ "$(state)" = paused ] && break; sleep 1; done
+[ "$(state)" = paused ] || { echo "реплика не встала на паузу: $(state)"; exit 1; }
+echo "replay: paused, dump in porgress"
+
+# Run pg_dump and capture its exact exit code
+docker exec "$C" sh -c "pg_dump -U postgres -Fc -Z zstd:3 -v -d $DB" > "$F.dump" 2> "$F.log"
+DUMP_EXIT=$?
+echo "pg_dump exit=$DUMP_EXIT"
+
+# Abort before uploading if pg_dump failed
+if [ "$DUMP_EXIT" -ne 0 ]; then
+    echo "pg_dump failed, skipping S3 upload"
+    exit "$DUMP_EXIT"
+fi
+
+# Resume WAL replay immediately so the replica catches up while S3 uploads
+q "select pg_wal_replay_resume()" >/dev/null
+echo "replay: $(state), uploading to S3..."
+
+# Upload both the dump and the verbose log to Ceph S3
+if "$PYTHON_BIN" "$SCRIPT_PATH" --filename "$F.dump" --bucket "$S3_BUCKET" && \
+   "$PYTHON_BIN" "$SCRIPT_PATH" --filename "$F.log" --bucket "$S3_BUCKET"; then
+    echo "S3 upload successful, removing local files"
+    rm -f "$F.dump" "$F.log"
+else
+    echo "S3 upload failed, keeping local backup at $F.dump"
+    exit 1
+fi
